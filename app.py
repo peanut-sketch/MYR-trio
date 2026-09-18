@@ -53,6 +53,16 @@ with T[0]:
     st.dataframe(access,use_container_width=True,hide_index=True,height=430)
     st.subheader('Contract completion')
     st.dataframe(results,use_container_width=True,hide_index=True)
+
+    st.divider()
+    st.subheader('📦 Download current scenario outputs')
+    st.caption(f'These files contain the currently selected Scenario {sc} results in the official submission schema.')
+    d1,d2,d3,d4=st.columns(4)
+    d1.download_button('⬇️ SCHEDULE_ACCESS.csv',access.to_csv(index=False).encode('utf-8'),'SCHEDULE_ACCESS.csv','text/csv',use_container_width=True,key='schedule_access_main')
+    d2.download_button('⬇️ SCHEDULE_OCCUPANCY.csv',occ.to_csv(index=False).encode('utf-8'),'SCHEDULE_OCCUPANCY.csv','text/csv',use_container_width=True,key='schedule_occupancy_main')
+    d3.download_button('⬇️ RESULTS.csv',results.to_csv(index=False).encode('utf-8'),'RESULTS.csv','text/csv',use_container_width=True,key='results_main')
+    d4.download_button('⬇️ All outputs (.zip)',output_zip_bytes(access,occ,results),f'RailFlowAI_Scenario_{sc}_Outputs.zip','application/zip',use_container_width=True,key='all_outputs_main')
+
     if changes:
         st.subheader('Displaced / changed work')
         st.dataframe(pd.DataFrame(changes,columns=['activity_id','old_first_week','new_first_week','reason']),use_container_width=True,hide_index=True)
@@ -84,9 +94,9 @@ with T[3]:
 with T[4]:
     st.subheader('Judge-format outputs')
     st.code('SCHEDULE_ACCESS.csv\nSCHEDULE_OCCUPANCY.csv\nRESULTS.csv')
-    st.download_button('Download all 3 outputs (.zip)',output_zip_bytes(access,occ,results),f'RailFlowAI_Scenario_{sc}_Outputs.zip','application/zip',use_container_width=True)
+    st.download_button('Download all 3 outputs (.zip)',output_zip_bytes(access,occ,results),f'RailFlowAI_Scenario_{sc}_Outputs.zip','application/zip',use_container_width=True,key='all_outputs_tab')
     a,b,c=st.columns(3)
-    a.download_button('SCHEDULE_ACCESS.csv',access.to_csv(index=False),'SCHEDULE_ACCESS.csv','text/csv',use_container_width=True)
-    b.download_button('SCHEDULE_OCCUPANCY.csv',occ.to_csv(index=False),'SCHEDULE_OCCUPANCY.csv','text/csv',use_container_width=True)
-    c.download_button('RESULTS.csv',results.to_csv(index=False),'RESULTS.csv','text/csv',use_container_width=True)
+    a.download_button('SCHEDULE_ACCESS.csv',access.to_csv(index=False).encode('utf-8'),'SCHEDULE_ACCESS.csv','text/csv',use_container_width=True,key='schedule_access_tab')
+    b.download_button('SCHEDULE_OCCUPANCY.csv',occ.to_csv(index=False).encode('utf-8'),'SCHEDULE_OCCUPANCY.csv','text/csv',use_container_width=True,key='schedule_occupancy_tab')
+    c.download_button('RESULTS.csv',results.to_csv(index=False).encode('utf-8'),'RESULTS.csv','text/csv',use_container_width=True,key='results_tab')
     st.caption('RESULTS.csv contains exactly one selected scenario; output column order matches the published submission schema.')
