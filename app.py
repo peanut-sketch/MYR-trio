@@ -1,5 +1,10 @@
-import io
-import zipfile
+"""
+RailFlow AI — Maintenance Access Scheduler
+Nebula X Hackathon | Problem Statement 1
+
+Streamlit dashboard for conflict-aware railway engineering access planning.
+"""
+
 from pathlib import Path
 
 import pandas as pd
@@ -13,102 +18,262 @@ import streamlit as st
 st.set_page_config(
     page_title="NebulaX RailFlow AI",
     page_icon="🚇",
-    layout="wide"
+    layout="wide",
 )
 
 
 # ============================================================
-# FILE PATHS
-# All CSV files are currently stored in the same folder as app.py
+# FILE RESOLUTION
+#
+# The CSV files may sit either directly beside app.py (the current
+# repository layout) or inside a data/public_results folder. Rather
+# than hard-coding one location, every candidate directory is searched
+# so the app runs unchanged locally, in Docker and on Streamlit Cloud.
 # ============================================================
 
 ROOT = Path(__file__).resolve().parent
 
-SCHEDULE_ACCESS_FILE = ROOT / "SCHEDULE_ACCESS.csv"
-SCHEDULE_OCCUPANCY_FILE = ROOT / "SCHEDULE_OCCUPANCY.csv"
-RESULTS_FILE = ROOT / "RESULTS.csv"
+CANDIDATE_DIRS = [
+    ROOT,
+    ROOT / "data" / "public_results",
+    ROOT / "public_results",
+    ROOT / "data",
+]
 
-ACTIVITY_FILE = ROOT / "08_ACTIVITY_DETAILS.csv"
+REQUIRED_PUBLIC_FILES = [
+    "SCHEDULE_ACCESS.csv",
+    "SCHEDULE_OCCUPANCY.csv",
+    "RESULTS.csv",
+]
+
+REQUIRED_INSTANCE_FILES = [
+    "01_LINES.csv",
+    "02_STATIONS.csv",
+    "03_SECTORS.csv",
+    "04_LOCATION_SUPPLY.csv",
+    "05_BUFFER_LOCATION.csv",
+    "06_PARAMETERS.csv",
+    "07_PROJECT_DETAILS.csv",
+    "08_ACTIVITY_DETAILS.csv",
+]
+
+
+def find_file(filename):
+    """
+    Return the first existing path for `filename` across the candidate
+    directories, or None when the file cannot be located anywhere.
+
+    Matching is case-insensitive so that a file saved as
+    Schedule_Access.csv on Windows is still found on a Linux container.
+    """
+
+    for directory in CANDIDATE_DIRS:
+
+        if not directory.is_dir():
+            continue
+
+        exact = directory / filename
+
+        if exact.exists():
+            return exact
+
+        for path in directory.iterdir():
+            if path.is_file() and path.name.lower() == filename.lower():
+                return path
+
+    return None
+
+
+def describe_search_locations():
+    """
+    Human-readable list of the directories that were searched, used in
+    error messages so a missing file can be diagnosed without a redeploy.
+    """
+
+    lines = []
+
+    for directory in CANDIDATE_DIRS:
+
+        if directory.is_dir():
+            names = sorted(
+                path.name
+                for path in directory.iterdir()
+                if path.is_file() and path.suffix.lower() == ".csv"
+            )
+            found = ", ".join(names) if names else "no CSV files"
+            lines.append(f"- `{directory}` → {found}")
+        else:
+            lines.append(f"- `{directory}` → directory does not exist")
+
+    return "\n".join(lines)
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# DATA LOADING
 # ============================================================
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
+def read_csv_cached(path_string):
+    """
+    Cached CSV read. The path is passed as a string so that the cache key
+    changes when the resolved location changes.
+    """
+
+    return pd.read_csv(path_string)
+
+
 def load_public_results():
     """
     Load the public demonstration schedule.
+
+    Returns (access, occupancy, results). Halts the app with a readable
+    message if any of the three files is missing.
     """
 
-    required_files = [
-        SCHEDULE_ACCESS_FILE,
-        SCHEDULE_OCCUPANCY_FILE,
-        RESULTS_FILE,
-    ]
+    resolved = {}
+    missing = []
 
-    missing = [file.name for file in required_files if not file.exists()]
+    for filename in REQUIRED_PUBLIC_FILES:
+
+        path = find_file(filename)
+
+        if path is None:
+            missing.append(filename)
+        else:
+            resolved[filename] = path
 
     if missing:
+
         st.error(
             "The following public result files could not be found: "
             + ", ".join(missing)
         )
+
+        st.markdown(
+            "**Locations searched:**\n\n" + describe_search_locations()
+        )
+
+        st.info(
+            "Place the CSV files beside `app.py`, or inside a "
+            "`data/public_results/` folder, then rerun the app. "
+            "If the files were added recently, clear the cache from "
+            "the sidebar so the new paths are picked up."
+        )
+
         st.stop()
 
-    access = pd.read_csv(SCHEDULE_ACCESS_FILE)
-    occupancy = pd.read_csv(SCHEDULE_OCCUPANCY_FILE)
-    results = pd.read_csv(RESULTS_FILE)
+    access = read_csv_cached(str(resolved["SCHEDULE_ACCESS.csv"]))
+    occupancy = read_csv_cached(str(resolved["SCHEDULE_OCCUPANCY.csv"]))
+    results = read_csv_cached(str(resolved["RESULTS.csv"]))
 
     return access, occupancy, results
 
 
-@st.cache_data
 def load_activity_details():
     """
-    Load activity information used for predecessor/dependency checks.
+    Load activity information used for predecessor / dependency checks.
+    Returns None when the file is unavailable.
     """
 
-    if not ACTIVITY_FILE.exists():
+    path = find_file("08_ACTIVITY_DETAILS.csv")
+
+    if path is None:
         return None
 
-    return pd.read_csv(ACTIVITY_FILE)
+    return read_csv_cached(str(path))
+
+
+# ============================================================
+# VALIDATION HELPERS
+# ============================================================
+
+def normalise_ids(series):
+    """
+    Trim whitespace and cast to string so that identifier comparison is
+    not defeated by stray spaces or numeric/text type differences.
+    """
+
+    return series.dropna().astype(str).str.strip()
 
 
 def validate_predecessors(activities):
     """
-    Check that every predecessor_activity_id refers to an existing activity.
+    Check that every predecessor_activity_id refers to an existing
+    activity.
+
+    Returns (invalid, dependencies) where `invalid` is a list of
+    (activity, missing_predecessor) tuples and `dependencies` is the
+    subset of rows that declare a predecessor.
     """
+
+    if activities is None or activities.empty:
+        return [], pd.DataFrame()
 
     if "predecessor_activity_id" not in activities.columns:
         return [], pd.DataFrame()
 
+    if "activity_id" not in activities.columns:
+        return [], pd.DataFrame()
+
     activities = activities.copy()
+
+    predecessor_values = (
+        activities["predecessor_activity_id"].astype(str).str.strip()
+    )
 
     predecessor_mask = (
         activities["predecessor_activity_id"].notna()
-        & (activities["predecessor_activity_id"].astype(str).str.strip() != "")
+        & ~predecessor_values.isin(["", "nan", "None", "-"])
     )
 
-    deps = activities.loc[predecessor_mask].copy()
+    dependencies = activities.loc[predecessor_mask].copy()
 
-    activity_ids = set(
-        activities["activity_id"]
-        .dropna()
-        .astype(str)
-        .str.strip()
-    )
+    known_ids = set(normalise_ids(activities["activity_id"]))
 
     invalid = []
 
-    for _, row in deps.iterrows():
+    for _, row in dependencies.iterrows():
+
         predecessor = str(row["predecessor_activity_id"]).strip()
         activity = str(row["activity_id"]).strip()
 
-        if predecessor not in activity_ids:
+        if predecessor not in known_ids:
             invalid.append((activity, predecessor))
 
-    return invalid, deps
+    return invalid, dependencies
+
+
+def find_self_references(activities):
+    """
+    Detect activities that list themselves as their own predecessor,
+    which would make the dependency graph infeasible.
+    """
+
+    if activities is None or activities.empty:
+        return []
+
+    columns = activities.columns
+
+    if "activity_id" not in columns or "predecessor_activity_id" not in columns:
+        return []
+
+    matches = activities.loc[
+        activities["activity_id"].astype(str).str.strip()
+        == activities["predecessor_activity_id"].astype(str).str.strip()
+    ]
+
+    return matches["activity_id"].astype(str).str.strip().tolist()
+
+
+def safe_nunique(frame, column):
+    """
+    Distinct count for a column, or "N/A" when the column is absent.
+    """
+
+    if column in frame.columns:
+        return frame[column].nunique()
+
+    return "N/A"
 
 
 # ============================================================
@@ -142,15 +307,8 @@ with st.sidebar:
 
     st.divider()
 
-    st.metric(
-        "Hard-rule target",
-        "0 violations"
-    )
-
-    st.metric(
-        "Workload target",
-        "100% scheduled"
-    )
+    st.metric("Hard-rule target", "0 violations")
+    st.metric("Workload target", "100% scheduled")
 
     st.divider()
 
@@ -176,6 +334,16 @@ with st.sidebar:
         "schedule. Hidden-instance upload performs data and dependency "
         "validation before optimisation."
     )
+
+    st.divider()
+
+    if st.button("🔄 Reload data files", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+    with st.expander("Data source"):
+        st.caption(f"Application directory: `{ROOT}`")
+        st.markdown(describe_search_locations())
 
 
 # ============================================================
@@ -214,75 +382,41 @@ with tab1:
 
     col1, col2, col3, col4 = st.columns(4)
 
-    # Activity count
     if "activity_id" in access_df.columns:
         activities_scheduled = access_df["activity_id"].nunique()
     else:
         activities_scheduled = len(access_df)
 
-    col1.metric(
-        "Activities Scheduled",
-        activities_scheduled
-    )
+    col1.metric("Activities Scheduled", activities_scheduled)
 
-    # Contract count
-    if "contract_number" in results_df.columns:
-        contracts = results_df["contract_number"].nunique()
-    else:
-        contracts = "N/A"
+    col2.metric("Contracts", safe_nunique(results_df, "contract_number"))
 
-    col2.metric(
-        "Contracts",
-        contracts
-    )
+    col3.metric("Access Records", len(access_df))
 
-    col3.metric(
-        "Access Records",
-        len(access_df)
-    )
-
-    # Overrun calculation
     if "overrun_days" in results_df.columns:
         overrun = pd.to_numeric(
             results_df["overrun_days"],
-            errors="coerce"
+            errors="coerce",
         ).fillna(0).sum()
-
         overrun = int(overrun)
-
     else:
         overrun = "N/A"
 
-    col4.metric(
-        "Overrun Days",
-        overrun
-    )
+    col4.metric("Overrun Days", overrun)
 
     st.divider()
 
     st.subheader("Contract Completion Overview")
 
-    st.dataframe(
-        results_df,
-        use_container_width=True,
-        hide_index=True
-    )
+    st.dataframe(results_df, use_container_width=True, hide_index=True)
 
     st.subheader("Scheduled Access")
 
-    st.dataframe(
-        access_df,
-        use_container_width=True,
-        hide_index=True
-    )
+    st.dataframe(access_df, use_container_width=True, hide_index=True)
 
     st.subheader("Track Occupancy")
 
-    st.dataframe(
-        occupancy_df,
-        use_container_width=True,
-        hide_index=True
-    )
+    st.dataframe(occupancy_df, use_container_width=True, hide_index=True)
 
     st.divider()
 
@@ -291,30 +425,27 @@ with tab1:
     d1, d2, d3 = st.columns(3)
 
     with d1:
-
         st.download_button(
-            label="⬇️ Download SCHEDULE_ACCESS.csv",
-            data=access_df.to_csv(index=False),
+            label="⬇️ SCHEDULE_ACCESS.csv",
+            data=access_df.to_csv(index=False).encode("utf-8"),
             file_name="SCHEDULE_ACCESS.csv",
             mime="text/csv",
             use_container_width=True,
         )
 
     with d2:
-
         st.download_button(
-            label="⬇️ Download SCHEDULE_OCCUPANCY.csv",
-            data=occupancy_df.to_csv(index=False),
+            label="⬇️ SCHEDULE_OCCUPANCY.csv",
+            data=occupancy_df.to_csv(index=False).encode("utf-8"),
             file_name="SCHEDULE_OCCUPANCY.csv",
             mime="text/csv",
             use_container_width=True,
         )
 
     with d3:
-
         st.download_button(
-            label="⬇️ Download RESULTS.csv",
-            data=results_df.to_csv(index=False),
+            label="⬇️ RESULTS.csv",
+            data=results_df.to_csv(index=False).encode("utf-8"),
             file_name="RESULTS.csv",
             mime="text/csv",
             use_container_width=True,
@@ -329,30 +460,31 @@ with tab2:
 
     st.header("Conflict & Dependency Detection")
 
-    activities = load_activity_details()
+    activities_df = load_activity_details()
 
-    if activities is None:
+    if activities_df is None:
 
-        st.error(
-            "08_ACTIVITY_DETAILS.csv could not be found."
+        st.error("08_ACTIVITY_DETAILS.csv could not be found.")
+
+        st.markdown(
+            "**Locations searched:**\n\n" + describe_search_locations()
         )
 
     else:
 
         invalid_predecessors, dependencies = validate_predecessors(
-            activities
+            activities_df
         )
-
-        # ----------------------------------------------------
-        # PREDECESSOR CHECK
-        # ----------------------------------------------------
 
         st.subheader("Predecessor Dependencies")
 
-        if "predecessor_activity_id" not in activities.columns:
+        if "predecessor_activity_id" not in activities_df.columns:
 
             st.warning(
-                "No predecessor_activity_id column was found."
+                "No `predecessor_activity_id` column was found in "
+                "08_ACTIVITY_DETAILS.csv, so dependency checking was "
+                "skipped. Columns present: "
+                + ", ".join(activities_df.columns)
             )
 
         else:
@@ -375,8 +507,7 @@ with tab2:
                 if column in dependencies.columns
             ]
 
-            if len(dependencies) > 0:
-
+            if len(dependencies) > 0 and available_columns:
                 st.dataframe(
                     dependencies[available_columns],
                     use_container_width=True,
@@ -385,40 +516,36 @@ with tab2:
 
             if invalid_predecessors:
 
-                st.error(
-                    "Invalid predecessor references detected."
-                )
-
-                invalid_df = pd.DataFrame(
-                    invalid_predecessors,
-                    columns=[
-                        "Activity",
-                        "Missing predecessor",
-                    ],
-                )
+                st.error("Invalid predecessor references detected.")
 
                 st.dataframe(
-                    invalid_df,
+                    pd.DataFrame(
+                        invalid_predecessors,
+                        columns=["Activity", "Missing predecessor"],
+                    ),
                     use_container_width=True,
                     hide_index=True,
                 )
 
             else:
-
                 st.success(
                     "All predecessor references point to valid activities."
                 )
 
+            self_references = find_self_references(activities_df)
+
+            if self_references:
+                st.error(
+                    "Activities listing themselves as their own "
+                    "predecessor: " + ", ".join(self_references)
+                )
+
         st.info(
             "Predecessor rule: an activity with a predecessor cannot "
-            "begin until its predecessor activity has finished. "
-            "The scheduler therefore treats the dependency as a "
+            "begin until its predecessor activity has finished. The "
+            "scheduler therefore treats the dependency as a "
             "finish-to-start constraint."
         )
-
-        # ----------------------------------------------------
-        # CONFLICT CLASSES
-        # ----------------------------------------------------
 
         st.subheader("Conflict Classes Checked")
 
@@ -467,21 +594,10 @@ with tab3:
     st.header("Hidden Instance Upload")
 
     st.write(
-        "Upload all eight competition CSV files. "
-        "RailFlow AI will validate the dataset before it is passed "
-        "to the scheduling engine."
+        "Upload all eight competition CSV files. RailFlow AI will "
+        "validate the dataset before it is passed to the scheduling "
+        "engine."
     )
-
-    required_files = [
-        "01_LINES.csv",
-        "02_STATIONS.csv",
-        "03_SECTORS.csv",
-        "04_LOCATION_SUPPLY.csv",
-        "05_BUFFER_LOCATION.csv",
-        "06_PARAMETERS.csv",
-        "07_PROJECT_DETAILS.csv",
-        "08_ACTIVITY_DETAILS.csv",
-    ]
 
     uploaded_files = st.file_uploader(
         "Select the 8 CSV files",
@@ -491,28 +607,22 @@ with tab3:
 
     if uploaded_files:
 
-        uploaded_names = [
-            file.name
-            for file in uploaded_files
-        ]
+        uploaded_names = [file.name for file in uploaded_files]
 
         missing_files = [
-            file
-            for file in required_files
-            if file not in uploaded_names
+            filename
+            for filename in REQUIRED_INSTANCE_FILES
+            if filename not in uploaded_names
         ]
 
         st.write(
-            f"**Files uploaded:** "
-            f"{len(uploaded_names)} / {len(required_files)}"
+            f"**Files uploaded:** {len(uploaded_names)} / "
+            f"{len(REQUIRED_INSTANCE_FILES)}"
         )
 
         if missing_files:
 
-            st.error(
-                "Missing required files: "
-                + ", ".join(missing_files)
-            )
+            st.error("Missing required files: " + ", ".join(missing_files))
 
         else:
 
@@ -523,51 +633,23 @@ with tab3:
                     for file in uploaded_files
                 }
 
-                activities_uploaded = frames[
-                    "08_ACTIVITY_DETAILS.csv"
-                ]
+                activities_uploaded = frames["08_ACTIVITY_DETAILS.csv"]
 
-                if "contract_number" in activities_uploaded.columns:
-
-                    contract_count = (
-                        activities_uploaded[
-                            "contract_number"
-                        ]
-                        .nunique()
-                    )
-
-                else:
-
-                    contract_count = "N/A"
-
-                st.success(
-                    "Dataset accepted successfully."
-                )
+                st.success("Dataset accepted successfully.")
 
                 c1, c2 = st.columns(2)
 
-                c1.metric(
-                    "Activities",
-                    len(activities_uploaded)
-                )
+                c1.metric("Activities", len(activities_uploaded))
 
                 c2.metric(
                     "Contracts",
-                    contract_count
+                    safe_nunique(activities_uploaded, "contract_number"),
                 )
 
-                # --------------------------------------------
-                # PREDECESSOR VALIDATION
-                # --------------------------------------------
+                st.subheader("Dependency Validation")
 
-                invalid, uploaded_dependencies = (
-                    validate_predecessors(
-                        activities_uploaded
-                    )
-                )
-
-                st.subheader(
-                    "Dependency Validation"
+                invalid, uploaded_dependencies = validate_predecessors(
+                    activities_uploaded
                 )
 
                 if invalid:
@@ -577,53 +659,45 @@ with tab3:
                         "reference(s) detected."
                     )
 
-                    invalid_df = pd.DataFrame(
-                        invalid,
-                        columns=[
-                            "Activity",
-                            "Invalid predecessor",
-                        ],
-                    )
-
                     st.dataframe(
-                        invalid_df,
+                        pd.DataFrame(
+                            invalid,
+                            columns=["Activity", "Invalid predecessor"],
+                        ),
                         use_container_width=True,
                         hide_index=True,
                     )
 
                 else:
 
-                    st.success(
-                        "Predecessor graph references are valid."
-                    )
+                    st.success("Predecessor graph references are valid.")
 
                     st.write(
-                        f"Dependencies detected: "
+                        "Dependencies detected: "
                         f"**{len(uploaded_dependencies)}**"
                     )
 
-                # --------------------------------------------
-                # FILE SUMMARY
-                # --------------------------------------------
-
-                st.subheader(
-                    "Dataset Summary"
+                uploaded_self_references = find_self_references(
+                    activities_uploaded
                 )
 
-                summary_rows = []
+                if uploaded_self_references:
+                    st.error(
+                        "Self-referencing activities detected: "
+                        + ", ".join(uploaded_self_references)
+                    )
 
-                for filename, dataframe in frames.items():
+                st.subheader("Dataset Summary")
 
-                    summary_rows.append(
+                summary_df = pd.DataFrame(
+                    [
                         {
                             "File": filename,
                             "Rows": len(dataframe),
                             "Columns": len(dataframe.columns),
                         }
-                    )
-
-                summary_df = pd.DataFrame(
-                    summary_rows
+                        for filename, dataframe in sorted(frames.items())
+                    ]
                 )
 
                 st.dataframe(
@@ -640,9 +714,7 @@ with tab3:
 
             except Exception as error:
 
-                st.error(
-                    f"Unable to process uploaded dataset: {error}"
-                )
+                st.error(f"Unable to process uploaded dataset: {error}")
 
 
 # ============================================================
@@ -701,9 +773,7 @@ feasible candidate and explain the associated trade-off.
 
     if scenario == "C — Disruption / urgent maintenance":
 
-        st.error(
-            "🚨 Emergency / disruption scenario active"
-        )
+        st.error("🚨 Emergency / disruption scenario active")
 
         st.write(
             """
@@ -721,8 +791,8 @@ feasible candidate and explain the associated trade-off.
     else:
 
         st.info(
-            "Select 'C — Disruption / urgent maintenance' from "
-            "the sidebar to view the emergency scheduling workflow."
+            "Select 'C — Disruption / urgent maintenance' from the "
+            "sidebar to view the emergency scheduling workflow."
         )
 
 
