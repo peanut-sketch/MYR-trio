@@ -113,9 +113,9 @@ RailFlow AI considers:
 
 ## 7. Web Application
 
-Hosted Application:
+Hosted Application: (via Streamlit)
 
-[INSERT STREAMLIT URL]
+https://myr-triogit-v6uad4bj8lmeqncnteo7dk.streamlit.app/
 
 The web interface allows planners to:
 
