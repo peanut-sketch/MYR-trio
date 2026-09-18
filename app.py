@@ -3,9 +3,14 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title='NebulaX RailFlow AI', page_icon='🚇', layout='wide')
+st.set_page_config(
+    page_title='NebulaX RailFlow AI',
+    page_icon='🚇',
+    layout='wide'
+)
+
 ROOT = Path(__file__).parent
-RESULTS = ROOT / 'data' / 'public_results'
+RESULTS = ROOT
 
 st.title('🚇 RailFlow AI — Maintenance Access Scheduler')
 st.caption('Conflict-aware railway engineering access planning | Nebula X Hackathon — Problem Statement 1')
@@ -40,7 +45,7 @@ with tab1:
     st.download_button('Download SCHEDULE_ACCESS.csv', a.to_csv(index=False), 'SCHEDULE_ACCESS.csv','text/csv')
 
 with tab2:
-    activities=pd.read_csv(ROOT/'data'/'08_ACTIVITY_DETAILS.csv')
+    activities=pd.read_csv(ROOT/'08_ACTIVITY_DETAILS.csv')
     deps=activities[activities['predecessor_activity_id'].notna()][['activity_id','predecessor_activity_id','planned_start_date','contract_number']]
     st.subheader('Predecessor dependencies')
     st.success(f'{len(deps)} finish-to-start dependencies detected automatically.')
