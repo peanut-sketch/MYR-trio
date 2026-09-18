@@ -195,7 +195,7 @@ but why.
 Three CSV outputs are provided for each planning scenario.
 
 ### Live Application
-[INSERT STREAMLIT URL]
+(https://myr-triogit-v6uad4bj8lmeqncnteo7dk.streamlit.app/)
 
 ### Video Demonstration
 [INSERT YOUTUBE URL]
