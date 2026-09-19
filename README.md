@@ -200,8 +200,6 @@ Three CSV outputs are provided for each planning scenario.
 ### Video Demonstration
 (https://youtu.be/RRZOZKBmaxc)
 
-### GitLab Repository
-[INSERT GITLAB URL]
 
 ---
 
