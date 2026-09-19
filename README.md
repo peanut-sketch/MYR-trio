@@ -198,7 +198,7 @@ Three CSV outputs are provided for each planning scenario.
 (https://myr-triogit-v6uad4bj8lmeqncnteo7dk.streamlit.app/)
 
 ### Video Demonstration
-[INSERT YOUTUBE URL]
+(https://youtu.be/RRZOZKBmaxc)
 
 ### GitLab Repository
 [INSERT GITLAB URL]
