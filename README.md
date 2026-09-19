@@ -33,6 +33,8 @@ The application:
 - Explains scheduling decisions
 - Produces competition-ready CSV outputs
 
+For a quick overview, watch our video: https://youtu.be/RRZOZKBmaxc
+
 ## 3. Scenarios
 
 ### Scenario A — Strict Supply / Flexible Schedule
