@@ -2,7 +2,7 @@ from pathlib import Path
 import tempfile
 import pandas as pd
 import streamlit as st
-from solver import load_instance, validate, score_schedule, compute_results, output_zip_bytes, replan_emergency, REQUIRED_INSTANCE
+from solver import load_instance, validate, score_schedule, compute_results, output_zip_bytes, replan_emergency, plan_scenario_b, closure_violations, REQUIRED_INSTANCE
 
 st.set_page_config(page_title='RailFlow AI | Nebula X',page_icon='🚇',layout='wide')
 ROOT=Path(__file__).resolve().parent
@@ -33,10 +33,12 @@ with st.sidebar:
         target=st.number_input('Requested first week',1,inst.horizon_weeks,max(1,cur-1),1)
 
 access=base_access.copy(); occ=base_occ.copy(); changes=[]; notes=[]
-if sc=='C' and emergency:
+if sc=='B':
+    access,occ,changes,notes=plan_scenario_b(inst,access,occ)
+elif sc=='C' and emergency:
     access,occ,changes,notes=replan_emergency(inst,access,occ,urgent,int(target))
 results=compute_results(inst,access,sc)
-viol=validate(inst,access,occ,sc); score=score_schedule(inst,access,occ,sc)
+viol=validate(inst,access,occ,sc)+closure_violations(inst,occ); score=score_schedule(inst,access,occ,sc)
 
 c1,c2,c3,c4,c5=st.columns(5)
 c1.metric('Activities',access.activity_id.nunique()); c2.metric('Work units',f"{sum(1.5 if int(x) else 1 for x in access.eclo):g}/{inst.activities.total_accesses.sum():g}")
@@ -48,8 +50,10 @@ for n in notes: st.warning(n)
 T=st.tabs(['📊 Schedule','🛡️ Validation','🧠 Explainability','📁 Hidden instance','⬇️ Submission outputs'])
 with T[0]:
     st.subheader(f'Scenario {sc} schedule')
-    if sc in ('B','C') and not emergency:
-        st.info('The bundled public schedule is displayed as the starting plan. Upload a scenario-specific hidden instance to run/validate its outputs; Scenario C also supports live urgent-maintenance what-if replanning.')
+    if sc=='B':
+        st.info('Scenario B: the base plan is repaired so every contract meets its planned completion date — late work is pulled into free weeks first, then ECLO-compressed, and only then given extra access-nights. Changes are listed below.')
+    elif sc=='C' and not emergency:
+        st.info('The bundled public schedule is displayed as the starting plan. Scenario C also supports live urgent-maintenance what-if replanning.')
     st.dataframe(access,use_container_width=True,hide_index=True,height=430)
     st.subheader('Contract completion')
     st.dataframe(results,use_container_width=True,hide_index=True)
@@ -65,7 +69,7 @@ with T[0]:
 
     if changes:
         st.subheader('Displaced / changed work')
-        st.dataframe(pd.DataFrame(changes,columns=['activity_id','old_first_week','new_first_week','reason']),use_container_width=True,hide_index=True)
+        st.dataframe(pd.DataFrame(changes,columns=['activity_id','from_week','to_week','reason']).astype({'from_week':'Int64','to_week':'Int64'}),use_container_width=True,hide_index=True)
 with T[1]:
     st.subheader('Mechanical checks')
     if viol: st.dataframe(pd.DataFrame(viol),use_container_width=True,hide_index=True)
