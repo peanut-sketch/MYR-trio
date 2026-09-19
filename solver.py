@@ -261,9 +261,9 @@ def replan_emergency(inst,base_access,base_occ,urgent_activity,target_week):
 # Closure zones (span + buffer sectors, Live mirror + interchange cross-over)
 # ---------------------------------------------------------------------------
 def closure_zone(inst, aid, paths=None, _cache={}):
-    """All locations an activity closes on its night (excluding nothing).
-    Buffer = N sectors beyond the worked sectors on each side (05_BUFFER_LOCATION);
-    Live also mirrors to the opposite bound and closes the other line's H01-H02."""
+    """All locations an activity closes on its night: worked sectors +/- N buffer sectors
+    (05_BUFFER_LOCATION) including the platforms at both ends. Live also closes the
+    other line's H01-H02 with the same buffer, and everything is mirrored to the opposite bound."""
     key = (id(inst), str(aid))
     if key in _cache: return _cache[key]
     paths = paths or build_location_paths(inst)
@@ -273,28 +273,28 @@ def closure_zone(inst, aid, paths=None, _cache={}):
     b = int(bmap.loc[nature, 'up_to_buffer_sectors']) if nature in bmap.index else 0
     opp = int(bmap.loc[nature, 'opposite_bound_required']) if nature in bmap.index else 0
     base = base_work_locations(inst, row, paths)
-    line, bound = parse_loc(base[0]); path = paths.get((line, bound), [])
-    zone = set(base)
-    idx = [path.index(x) for x in base if x in path]
-    if b and idx:
-        zone.update(path[max(0, min(idx) - 2 * b): max(idx) + 2 * b + 1])
+    line, bound = parse_loc(base[0])
+
+    def around(ln, bd, locs):
+        path = paths.get((ln, bd), []); idx = [path.index(x) for x in locs if x in path]
+        if not idx: return set(locs)
+        return set(path[max(0, min(idx) - 2 * b - 1): max(idx) + 2 * b + 2])
+
+    zone = around(line, bound, base)
+    if nature == 'Live' and any(':H01' in x or 'H02' in x for x in zone):
+        ol = 'BET' if line == 'ALP' else 'ALP'
+        zone |= around(ol, bound, [f'SEC:{ol}:H01_H02:{bound}'])
     if opp:
-        other = 'WB' if bound == 'EB' else 'EB'
-        zone |= {':'.join(x.split(':')[:-1] + [other]) for x in list(zone)}
-    if nature == 'Live':
-        otherline = 'BET' if line == 'ALP' else 'ALP'
-        for x in list(zone):
-            if 'H01_H02' in x or ':H01:' in x or ':H02:' in x:
-                p = x.split(':'); p[1] = otherline; zone.add(':'.join(p))
+        zone |= {':'.join(x.split(':')[:-1] + ['WB' if x.endswith(':EB') else 'EB']) for x in list(zone)}
     valid = set(inst.supply.location_id.astype(str))
     _cache[key] = zone & valid
     return _cache[key]
 
 
 def closure_violations(inst, occupancy):
-    """Approximation of the judge's `closure` rule: activity Y may not occupy X's buffer
-    in the same week unless the two share a location (i.e. co-share, or are split onto
-    separate nights by co_share_group there)."""
+    """Approximation of the judge's `closure` rule (matches the judge on the public data):
+    activity Y may not occupy a tunnel sector in X's buffer in the same week unless the
+    two share a location (co-share, or are split onto separate nights by co_share_group)."""
     v = []; paths = build_location_paths(inst); known = set(inst.activities.activity_id.astype(str))
     for w, gw in occupancy.groupby('week'):
         spans = {str(a): set(g.location_id) for a, g in gw.groupby('activity_id') if str(a) in known}
@@ -302,7 +302,7 @@ def closure_violations(inst, occupancy):
             buf = closure_zone(inst, x, paths) - xs
             if not buf: continue
             for y, ys in spans.items():
-                if y != x and (ys & buf) and not (ys & xs):
+                if y != x and any(l.startswith('SEC') for l in ys & buf) and not (ys & xs):
                     v.append({'rule': 'closure', 'detail': f'wk{w}: {y} inside closure of {x} at {sorted(ys & buf)}'})
     return v
 
@@ -415,13 +415,18 @@ def plan_scenario_b(inst, base_access, base_occ):
         nonlocal access, occ
         for a, w in late():
             for t in candidates(a):
-                blockers, _ = check(a, t)
-                snap = (access.copy(), occ.copy(), len(changes)); ok = True
-                for x in blockers:
+                snap = (access.copy(), occ.copy(), len(changes))
+                # lift the late access out first so its old week is free for blockers to use
+                row = access[(access.activity_id == a) & (access.week == w)].copy()
+                access = access[~((access.activity_id == a) & (access.week == w))]
+                occ = occ[~((occ.activity_id == a) & (occ.week == w))]
+                ok = True
+                for x in sorted(check(a, t)[0]):
                     t2 = best_clean(x, exclude=(t,))
                     if t2 is None: ok = False; break
                     move(x, t, t2, f'bumped to make room for {a}')
                 if ok and not check(a, t)[0]:
+                    access = pd.concat([access, row], ignore_index=True)
                     move(a, w, t, 'pulled forward after re-slotting blocker(s)'); break
                 access, occ = snap[0], snap[1]; del changes[snap[2]:]
 
