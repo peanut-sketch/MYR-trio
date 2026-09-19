@@ -255,3 +255,185 @@ def replan_emergency(inst,base_access,base_occ,urgent_activity,target_week):
         oldweeks=sorted(s.week.unique()); _shift_activity(access,occ,aid,delta); moves.append((aid,min(oldweeks),min(oldweeks)+delta,'urgent request'))
     moves += _repair_dependencies(inst,access,occ)
     return access.sort_values(['week','access_night','activity_id','access_seq']).reset_index(drop=True), occ.sort_values(['week','location_id','activity_id']).reset_index(drop=True), moves, notes
+
+
+# ---------------------------------------------------------------------------
+# Closure zones (span + buffer sectors, Live mirror + interchange cross-over)
+# ---------------------------------------------------------------------------
+def closure_zone(inst, aid, paths=None, _cache={}):
+    """All locations an activity closes on its night (excluding nothing).
+    Buffer = N sectors beyond the worked sectors on each side (05_BUFFER_LOCATION);
+    Live also mirrors to the opposite bound and closes the other line's H01-H02."""
+    key = (id(inst), str(aid))
+    if key in _cache: return _cache[key]
+    paths = paths or build_location_paths(inst)
+    row = inst.activities.set_index('activity_id').loc[aid]
+    nature = str(inst.projects.set_index('contract_number').loc[row.contract_number, 'nature_of_activity'])
+    bmap = inst.buffers.set_index('nature_of_works')
+    b = int(bmap.loc[nature, 'up_to_buffer_sectors']) if nature in bmap.index else 0
+    opp = int(bmap.loc[nature, 'opposite_bound_required']) if nature in bmap.index else 0
+    base = base_work_locations(inst, row, paths)
+    line, bound = parse_loc(base[0]); path = paths.get((line, bound), [])
+    zone = set(base)
+    idx = [path.index(x) for x in base if x in path]
+    if b and idx:
+        zone.update(path[max(0, min(idx) - 2 * b): max(idx) + 2 * b + 1])
+    if opp:
+        other = 'WB' if bound == 'EB' else 'EB'
+        zone |= {':'.join(x.split(':')[:-1] + [other]) for x in list(zone)}
+    if nature == 'Live':
+        otherline = 'BET' if line == 'ALP' else 'ALP'
+        for x in list(zone):
+            if 'H01_H02' in x or ':H01:' in x or ':H02:' in x:
+                p = x.split(':'); p[1] = otherline; zone.add(':'.join(p))
+    valid = set(inst.supply.location_id.astype(str))
+    _cache[key] = zone & valid
+    return _cache[key]
+
+
+def closure_violations(inst, occupancy):
+    """Approximation of the judge's `closure` rule: activity Y may not occupy X's buffer
+    in the same week unless the two share a location (i.e. co-share, or are split onto
+    separate nights by co_share_group there)."""
+    v = []; paths = build_location_paths(inst); known = set(inst.activities.activity_id.astype(str))
+    for w, gw in occupancy.groupby('week'):
+        spans = {str(a): set(g.location_id) for a, g in gw.groupby('activity_id') if str(a) in known}
+        for x, xs in spans.items():
+            buf = closure_zone(inst, x, paths) - xs
+            if not buf: continue
+            for y, ys in spans.items():
+                if y != x and (ys & buf) and not (ys & xs):
+                    v.append({'rule': 'closure', 'detail': f'wk{w}: {y} inside closure of {x} at {sorted(ys & buf)}'})
+    return v
+
+
+# ---------------------------------------------------------------------------
+# Scenario B: hit every planned completion date at least ECLO / excess cost
+# ---------------------------------------------------------------------------
+def deadline_week(inst, contract):
+    """Last week whose week_end is on/before the contract's planned completion date."""
+    planned = pd.Timestamp(inst.projects.set_index('contract_number').loc[contract, 'planned_completion_date'])
+    return max(1, ((planned - inst.horizon_start).days - 6) // 7 + 1)
+
+
+def plan_scenario_b(inst, base_access, base_occ):
+    """Repair a base plan so no contract overruns (Scenario B). Levers, cheapest first:
+    1) pull late accesses into a clean earlier week (0 cost),
+    2) ECLO-compress an activity and drop its late tail accesses (5 per ECLO night),
+    3) bump a blocking access to another clean week, then pull the late access in,
+    4) as a last resort accept extra access-nights above supply (7 each)."""
+    access = base_access.copy(); occ = base_occ.copy(); changes = []; notes = []
+    paths = build_location_paths(inst)
+    A = inst.activities.assign(activity_id=inst.activities.activity_id.astype(str)).set_index('activity_id')
+    P = inst.projects.set_index(['contract_number', 'activity_type'])
+    supply = inst.supply.set_index('location_id').supply_capacity.to_dict()
+    dl = {c: deadline_week(inst, c) for c in inst.projects.contract_number}
+    access['activity_id'] = access.activity_id.astype(str); occ['activity_id'] = occ.activity_id.astype(str)
+    span = {a: sorted(set(g.location_id)) for a, g in occ.groupby('activity_id')}
+
+    def weeks(a): return sorted(access.loc[access.activity_id == a, 'week'].astype(int))
+
+    def window(a):
+        r = A.loc[a]; lo = week_of(r.planned_start_date, inst.horizon_start)
+        pred = r.predecessor_activity_id
+        if pd.notna(pred) and str(pred).strip() and weeks(str(pred)): lo = max(lo, weeks(str(pred))[-1] + 1)
+        hi = min(dl[r.contract_number], inst.horizon_weeks)
+        for s in A.index[A.predecessor_activity_id.astype(str) == a]:
+            if weeks(s): hi = min(hi, weeks(s)[0] - 1)
+        return lo, hi
+
+    def free_night(a, w):
+        r = A.loc[a]; p = P.loc[(r.contract_number, r.activity_type)]
+        X = access.merge(inst.activities[['activity_id', 'contract_number', 'activity_type']].astype({'activity_id': str}), on='activity_id')
+        same = X[(X.contract_number == r.contract_number) & (X.activity_type == r.activity_type) & (X.week == w) & (X.activity_id != a)]
+        for n in range(1, int(p.number_of_maximum_access_per_week) + 1):
+            if same[same.access_night == n].activity_id.nunique() < int(p.number_of_workfronts): return n
+        return None
+
+    def check(a, w):
+        """(blockers, excess) for placing activity a in week w. Strict: no buffer contact at all."""
+        S = set(span[a]); mybuf = closure_zone(inst, a, paths) - S; blockers = set()
+        gw = occ[(occ.week == w) & (occ.activity_id != a)]
+        for x, gx in gw.groupby('activity_id'):
+            xs = set(gx.location_id); xbuf = closure_zone(inst, x, paths) - xs
+            if (S & xbuf) or (mybuf & xs) or (mybuf & xbuf): blockers.add(x)
+        excess = sum(1 for L in S if gw[gw.location_id == L].co_share_group.nunique() + 1 > int(supply.get(L, 0)))
+        return blockers, excess
+
+    def contact(a, w):   # shares any location with other work that week (prefer weeks where it doesn't)
+        return bool(set(span[a]) & set(occ[(occ.week == w) & (occ.activity_id != a)].location_id))
+
+    def best_clean(a, exclude=()):
+        ok = [t for t in candidates(a, exclude) if check(a, t) == (set(), 0)]
+        return min(ok, key=lambda t: (contact(a, t), -t)) if ok else None
+
+    def move(a, w_from, w_to, reason):
+        nonlocal occ
+        n = free_night(a, w_to)
+        m = (access.activity_id == a) & (access.week == w_from)
+        access.loc[m, ['week', 'access_night']] = [w_to, n]
+        occ = occ[~((occ.activity_id == a) & (occ.week == w_from))]
+        rows = []
+        for L in span[a]:
+            used = set(occ[(occ.location_id == L) & (occ.week == w_to)].co_share_group)
+            rows.append({'activity_id': a, 'week': w_to, 'location_id': L,
+                         'co_share_group': next(f'b{i}' for i in range(1, 99) if f'b{i}' not in used)})
+        occ = pd.concat([occ, pd.DataFrame(rows)], ignore_index=True)
+        changes.append((a, w_from, w_to, reason))
+
+    def candidates(a, exclude=()):
+        lo, hi = window(a); have = set(weeks(a))
+        return [w for w in range(hi, lo - 1, -1) if w not in have and w not in exclude and free_night(a, w)]
+
+    def late():
+        return [(a, w) for a in A.index for w in weeks(a) if w > dl[A.loc[a, 'contract_number']]]
+
+    def pull_clean(reason='pulled forward (free slot)'):
+        for a, w in late():
+            t = best_clean(a)
+            if t is not None: move(a, w, t, reason)
+
+    def compress():
+        nonlocal occ
+        for a in sorted({a for a, _ in late()}):
+            d = dl[A.loc[a, 'contract_number']]; s = access[access.activity_id == a]
+            keep = s[s.week <= d].sort_values('week', ascending=False)
+            need = float(A.loc[a, 'total_accesses']); units = sum(access_units(x) for x in keep.eclo)
+            convert = []
+            for i, r in keep.iterrows():
+                if units + 1e-9 >= need: break
+                if int(r.eclo) == 0: convert.append(i); units += 0.5
+            if units + 1e-9 < need: continue            # ECLO alone cannot absorb it
+            for i in convert:
+                access.loc[i, 'eclo'] = 1; changes.append((a, int(access.loc[i, 'week']), int(access.loc[i, 'week']), 'converted to ECLO (1.5 units)'))
+            for w in sorted(s[s.week > d].week):
+                access.drop(access[(access.activity_id == a) & (access.week == w)].index, inplace=True)
+                occ = occ[~((occ.activity_id == a) & (occ.week == w))]
+                changes.append((a, int(w), None, 'dropped (covered by ECLO)'))
+
+    def bump_blockers():
+        nonlocal access, occ
+        for a, w in late():
+            for t in candidates(a):
+                blockers, _ = check(a, t)
+                snap = (access.copy(), occ.copy(), len(changes)); ok = True
+                for x in blockers:
+                    t2 = best_clean(x, exclude=(t,))
+                    if t2 is None: ok = False; break
+                    move(x, t, t2, f'bumped to make room for {a}')
+                if ok and not check(a, t)[0]:
+                    move(a, w, t, 'pulled forward after re-slotting blocker(s)'); break
+                access, occ = snap[0], snap[1]; del changes[snap[2]:]
+
+    def accept_excess():
+        for a, w in late():
+            opts = [(check(a, t)[1], -t, t) for t in candidates(a) if not check(a, t)[0]]
+            if opts: move(a, w, min(opts)[2], 'pulled forward using extra access-night(s)')
+
+    pull_clean(); compress(); pull_clean(); bump_blockers(); accept_excess()
+    for a, w in late(): notes.append(f'Scenario B: {a} still late in week {w} — no feasible repair found.')
+    access = access.sort_values(['activity_id', 'week']).reset_index(drop=True)
+    access['access_seq'] = access.groupby('activity_id').cumcount() + 1
+    access = access[['activity_id', 'access_seq', 'week', 'eclo', 'access_night']].astype({'week': int, 'eclo': int, 'access_night': int})
+    occ = occ.sort_values(['activity_id', 'week', 'location_id']).reset_index(drop=True)
+    return access, occ, changes, notes
